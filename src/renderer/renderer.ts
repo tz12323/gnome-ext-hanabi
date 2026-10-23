@@ -139,6 +139,15 @@ const HanabiRenderer = GObject.registerClass(
 
         private adapter: any;
         private media: Gtk.MediaFile | null;
+        // GtkMediaFile fallback looping is managed manually: native `loop`
+        // can stall at EOS without emitting anything on GTK4/GStreamer.
+        private mediaEndedId: number | null = null;
+        private mediaLoopTarget: Gtk.MediaFile | null = null;
+        private mediaPositionTimeoutId = 0;
+        private mediaRestartPending = false;
+        // Desired playback state, used by the manual loop so an auto/user pause
+        // is not undone when the stream reaches EOS.
+        private shouldPlay = false;
 
         private dbus: any;
         private display: Gdk.Display | null;
@@ -162,6 +171,11 @@ const HanabiRenderer = GObject.registerClass(
             this.play = null;
             this.adapter = null;
             this.media = null;
+            this.mediaEndedId = null;
+            this.mediaLoopTarget = null;
+            this.mediaPositionTimeoutId = 0;
+            this.mediaRestartPending = false;
+            this.shouldPlay = false;
             this.dbus = null;
             this.display = null;
             this.monitors = [];
@@ -505,7 +519,7 @@ const HanabiRenderer = GObject.registerClass(
             this.gstImplName = 'GtkMediaFile';
 
             this.media = Gtk.MediaFile.new_for_filename(videoPath);
-            this.media.set({loop: true});
+            this.setupMediaLoop(this.media);
 
             this.media.connect('notify::prepared', () => {
                 this.setVolume(volume);
@@ -529,6 +543,67 @@ const HanabiRenderer = GObject.registerClass(
             this.setAutoWallpaper();
 
             return widget;
+        }
+
+        // GtkMediaFile's native loop property is unreliable on GTK4: the
+        // pipeline can stop at EOS without emitting `ended` or restarting.
+        // Drive looping manually and keep a low-rate position watchdog for
+        // backends that get stuck without emitting the signal.
+        private setupMediaLoop(media: Gtk.MediaFile): void {
+            if (this.mediaEndedId !== null && this.mediaLoopTarget) {
+                this.mediaLoopTarget.disconnect(this.mediaEndedId);
+                this.mediaEndedId = null;
+            }
+            if (this.mediaPositionTimeoutId) {
+                GLib.source_remove(this.mediaPositionTimeoutId);
+                this.mediaPositionTimeoutId = 0;
+            }
+            this.mediaLoopTarget = media;
+
+            this.mediaEndedId = media.connect('notify::ended', () => {
+                if (media.ended)
+                    this.restartMedia(media);
+            });
+
+            this.mediaPositionTimeoutId = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT,
+                1,
+                () => {
+                    if (this.media !== media) {
+                        this.mediaPositionTimeoutId = 0;
+                        return GLib.SOURCE_REMOVE;
+                    }
+
+                    if (!this.shouldPlay)
+                        return GLib.SOURCE_CONTINUE;
+
+                    const duration = media.duration;
+                    const position = media.timestamp;
+                    if (
+                        media.ended ||
+                        (duration > 0 && position > 0 &&
+                            duration - position < GLib.USEC_PER_SEC / 2)
+                    )
+                        this.restartMedia(media);
+
+                    return GLib.SOURCE_CONTINUE;
+                }
+            );
+        }
+
+        private restartMedia(media: Gtk.MediaFile): void {
+            if (this.media !== media || !this.shouldPlay || this.mediaRestartPending)
+                return;
+
+            this.mediaRestartPending = true;
+            GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                this.mediaRestartPending = false;
+                if (this.media !== media || !this.shouldPlay)
+                    return GLib.SOURCE_REMOVE;
+                media.seek(0);
+                media.play();
+                return GLib.SOURCE_REMOVE;
+            });
         }
 
         private exportDbus(): void {
@@ -589,7 +664,11 @@ const HanabiRenderer = GObject.registerClass(
             if (this.play) {
                 this.play.set_uri(file.get_uri());
             } else if (this.media) {
+                // Clearing `file` releases the previous stream's file
+                // descriptor; reassigning it directly after
+                // stream_unprepared() can leak file descriptors.
                 this.media.stream_unprepared();
+                this.media.file = null;
                 this.media.file = file;
             }
             this.markRandomStartPending();
@@ -597,13 +676,20 @@ const HanabiRenderer = GObject.registerClass(
         }
 
         setPlay(): void {
-            if (this.play)
+            this.shouldPlay = true;
+            if (this.play) {
                 this.play.play();
-            else if (this.media)
+            } else if (this.media) {
+                // After EOS the stream stays ended; seek back before playing so
+                // resuming after a pause actually restarts the video.
+                if (this.media.ended)
+                    this.media.seek(0);
                 this.media.play();
+            }
         }
 
         setPause(): void {
+            this.shouldPlay = false;
             if (this.play)
                 this.play.pause();
             else if (this.media)
