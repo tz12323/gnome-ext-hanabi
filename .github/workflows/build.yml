@@ -2,10 +2,10 @@ name: Build extension zip
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [main, master]
   workflow_dispatch:
 
 # Read by default. The release job below opts into write.

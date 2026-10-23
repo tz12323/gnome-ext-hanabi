@@ -611,6 +611,9 @@ const HanabiRenderer = GObject.registerClass(
         }
 
         setAutoWallpaper(): void {
+            if (!extSettings)
+                return;
+
             let currentIndex = 0;
             let videoPaths: string[] = [];
             const dir = Gio.File.new_for_path(changeWallpaperDirectoryPath);
@@ -633,9 +636,19 @@ const HanabiRenderer = GObject.registerClass(
                         videoPaths.push(path);
                 }
             }
+            enumerator.close(null);
+
             if (videoPaths.length === 0)
                 return;
             videoPaths = videoPaths.sort();
+
+            // Continue from the video that is currently playing instead of always
+            // restarting from the first entry (which also matches a manually chosen
+            // wallpaper with the automatic changer).
+            const currentVideoPath = extSettings.get_string('video-path');
+            currentIndex = videoPaths.indexOf(currentVideoPath);
+            if (currentIndex === -1)
+                currentIndex = 0;
 
             const getRandomIndex = (actualIndex: number, videosLength: number): number => {
                 if (videosLength <= 1)

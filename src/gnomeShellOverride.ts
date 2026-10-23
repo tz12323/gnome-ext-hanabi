@@ -46,6 +46,19 @@ function isRendererActor(actor: Meta.WindowActor | null | undefined): boolean {
     return isRendererWindow(window);
 }
 
+// Blur My Shell's static-blur pipelines create a hidden `${widget}-source`
+// container and feed it to a BackgroundManager. Only those containers should
+// receive our lightweight live-frame clone.
+function isBlurSampleContainer(
+    container: Clutter.Actor | null | undefined
+): container is Clutter.Actor {
+    const name = container?.get_name();
+    return name?.endsWith('-source') === true && name.includes('bms');
+}
+
+// An emitter paired with a signal handler id, disconnected together in disable().
+type SignalConnection = [emitter: {disconnect(id: number): void}, id: number];
+
 export class GnomeShellOverride {
     // Method patching, plus the original get_window_actors captured from our override of it
     // (the override hides renderer windows, so LiveWallpaper uses this to still find them).
@@ -61,9 +74,14 @@ export class GnomeShellOverride {
     // can be connected to a primary wallpaper created later (or recreated).
     private blurSamples = new Map<Clutter.Actor, {monitor: number; destroyId: number}>();
 
-    // Settings and its tracked signal connections.
+    // Settings and tracked signal connections, all cleaned up in disable().
     private settings: Gio.Settings;
     private settingsChangedIds: number[] = [];
+    // Global/session signals (not owned by settings) and their emitters.
+    private emitterConnections: SignalConnection[] = [];
+    // Delayed scans for Blur My Shell containers created before enable().
+    private blurSampleScanTimeoutIds: number[] = [];
+    private enabled = false;
 
     constructor(settings: Gio.Settings) {
         this.settings = settings;
@@ -95,6 +113,9 @@ export class GnomeShellOverride {
                 Main.layoutManager.emit('monitors-changed');
 
             global.display.emit('workareas-changed');
+            // BMS rebuilds its background managers asynchronously after
+            // monitors-changed; scan again once its new containers exist.
+            this.scheduleBlurSampleScan(BACKGROUND_RELOAD_REFRESH_DELAY_MS * 2);
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -111,6 +132,52 @@ export class GnomeShellOverride {
         this.primaryWallpapers.get(monitor)?.addSampleTarget(container);
     }
 
+    // The main layout background is mapped for the whole session, while the
+    // overview and lock-screen backgrounds are unmapped most of the time. A
+    // Clutter.Clone of an unmapped source cannot provide fresh frames, so prefer
+    // the main background for BMS static-blur samples.
+    private isMainBackgroundManager(manager: object): boolean {
+        const backgroundGroup = (
+            Main.layoutManager as unknown as {_backgroundGroup?: Clutter.Actor}
+        )._backgroundGroup;
+        const container = (manager as {_container?: Clutter.Actor})._container;
+        return backgroundGroup != null && container === backgroundGroup;
+    }
+
+    private attachSamplesToPrimary(monitor: number, actor: LiveWallpaper): void {
+        for (const [sample, {monitor: sampleMonitor}] of this.blurSamples) {
+            if (sampleMonitor === monitor)
+                actor.addSampleTarget(sample);
+        }
+    }
+
+    private updatePrimaryWallpaper(
+        monitor: number,
+        actor: LiveWallpaper,
+        isMainBackground: boolean
+    ): void {
+        const current = this.primaryWallpapers.get(monitor);
+        if (current === actor) {
+            this.attachSamplesToPrimary(monitor, actor);
+            return;
+        }
+
+        // Keep the first actor as a fallback, but let the main background replace
+        // any other actor (workspace/lock screen) created earlier.
+        if (current && !isMainBackground)
+            return;
+
+        if (current) {
+            for (const [sample, {monitor: sampleMonitor}] of this.blurSamples) {
+                if (sampleMonitor === monitor)
+                    current.removeSampleTarget(sample);
+            }
+        }
+
+        this.primaryWallpapers.set(monitor, actor);
+        this.attachSamplesToPrimary(monitor, actor);
+    }
+
     private clearBlurSamples(): void {
         for (const [container, {destroyId}] of this.blurSamples) {
             try {
@@ -120,6 +187,66 @@ export class GnomeShellOverride {
             }
         }
         this.blurSamples.clear();
+    }
+
+    // Blur My Shell can create its static-blur sampling containers before Hanabi
+    // is enabled (Hanabi waits for startup-complete), so those containers never
+    // pass through our _createBackgroundActor override. Find them in the actor
+    // tree and attach the live frame to them as well; otherwise their blur input
+    // stays frozen on the static wallpaper.
+    private scanBlurSampleContainers(): void {
+        if (!this.enabled)
+            return;
+
+        const visit = (actor: Clutter.Actor): void => {
+            if (isBlurSampleContainer(actor))
+                this.registerExistingBlurSample(actor);
+
+            for (const child of actor.get_children())
+                visit(child);
+        };
+
+        try {
+            visit(global.stage);
+        } catch (e) {
+            logger.warn('Failed to scan for Blur My Shell sampling containers:', e);
+        }
+    }
+
+    private registerExistingBlurSample(container: Clutter.Actor): void {
+        if (this.blurSamples.has(container))
+            return;
+
+        const backgroundActor = container
+            .get_children()
+            .find(child => child instanceof Meta.BackgroundActor) as
+            | Meta.BackgroundActor
+            | undefined;
+
+        // The manager may not have populated the container yet; a later scan
+        // will pick it up with the correct monitor index.
+        if (!backgroundActor)
+            return;
+
+        const monitor = backgroundActor.monitor;
+
+        logger.debug(`Registering existing blur sample (monitor ${monitor})`);
+        this.registerBlurSample(container, monitor);
+    }
+
+    private scheduleBlurSampleScan(delayMs: number): void {
+        if (!this.enabled)
+            return;
+
+        let timeoutId = 0;
+        timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delayMs, () => {
+            this.blurSampleScanTimeoutIds = this.blurSampleScanTimeoutIds.filter(
+                id => id !== timeoutId
+            );
+            this.scanBlurSampleContainers();
+            return GLib.SOURCE_REMOVE;
+        });
+        this.blurSampleScanTimeoutIds.push(timeoutId);
     }
 
     private markRendererWindows(): void {
@@ -146,10 +273,11 @@ export class GnomeShellOverride {
         // Overview can re-show window actors while constructing previews. The
         // renderer actor is only an offscreen source for our clone, so keep it
         // hidden after the overview transition instead of racing each preview.
-        global.stage.connect('after-paint', () => {
+        const paintId = global.stage.connect('after-paint', () => {
             if (Main.overview.visible)
                 this.hideRendererWindows();
         });
+        this.emitterConnections.push([global.stage, paintId]);
     }
 
     private reloadLockScreenBackgrounds(): void {
@@ -168,6 +296,7 @@ export class GnomeShellOverride {
 
     enable(): void {
         logger.debug('Installing overrides');
+        this.enabled = true;
 
         // eslint-disable-next-line @typescript-eslint/no-this-alias
         const thisRef = this;
@@ -194,7 +323,7 @@ export class GnomeShellOverride {
                     // static panel/dock blur. Give their sampling container a
                     // lightweight clone of the primary live actor instead of a
                     // second LiveWallpaper (which owns lifecycle/effects state).
-                    if (container?.get_name()?.endsWith('-source')) {
+                    if (isBlurSampleContainer(container)) {
                         logger.debug(`Attaching blur sample (monitor ${backgroundActor.monitor})`);
                         thisRef.registerBlurSample(container, backgroundActor.monitor);
                         return backgroundActor;
@@ -207,13 +336,11 @@ export class GnomeShellOverride {
                         thisRef.getAllWindowActors
                     );
                     thisRef.wallpaperActors.add(this.wallpaperActor);
-                    if (!thisRef.primaryWallpapers.has(backgroundActor.monitor))
-                        thisRef.primaryWallpapers.set(backgroundActor.monitor, this.wallpaperActor);
-
-                    for (const [sample, {monitor}] of thisRef.blurSamples) {
-                        if (monitor === backgroundActor.monitor)
-                            this.wallpaperActor.addSampleTarget(sample);
-                    }
+                    thisRef.updatePrimaryWallpaper(
+                        backgroundActor.monitor,
+                        this.wallpaperActor,
+                        thisRef.isMainBackgroundManager(this)
+                    );
 
                     this.wallpaperActor.connect('destroy', (actor: LiveWallpaper) => {
                         thisRef.wallpaperActors.delete(actor);
@@ -357,14 +484,15 @@ export class GnomeShellOverride {
             }
         );
 
-        this.settingsChangedIds.push(
+        this.emitterConnections.push([
+            global.display,
             global.display.connect('window-created', (_display, window: Meta.Window) => {
                 if (isRendererWindow(window)) {
                     thisRef.markRendererWindows();
                     thisRef.hideRendererWindows();
                 }
-            })
-        );
+            }),
+        ]);
 
         this.settingsChangedIds.push(
             this.settings.connect('changed::show-on-lock-screen', () => {
@@ -377,10 +505,26 @@ export class GnomeShellOverride {
         this.markRendererWindows();
         this.hideRendererWindows();
         this.keepRendererWindowsHidden();
+
+        // Blur My Shell containers may already exist (it is usually enabled
+        // before Hanabi's startup-delay elapses), so scan now and shortly after
+        // its own asynchronous rebuild completes.
+        this.scheduleBlurSampleScan(0);
+        this.scheduleBlurSampleScan(1000);
+        this.scheduleBlurSampleScan(3000);
     }
 
     disable(): void {
         logger.debug('Removing overrides');
+        this.enabled = false;
+
+        for (const id of this.blurSampleScanTimeoutIds)
+            GLib.source_remove(id);
+        this.blurSampleScanTimeoutIds = [];
+
+        for (const [emitter, id] of this.emitterConnections)
+            emitter.disconnect(id);
+        this.emitterConnections = [];
 
         for (const id of this.settingsChangedIds)
             this.settings.disconnect(id);

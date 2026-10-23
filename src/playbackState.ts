@@ -70,6 +70,7 @@ export class PlaybackState {
     private renderer = new RendererWrapper();
     private machineDefinition: StateMachineDefinition;
     private machine!: StateMachine;
+    private isPlayingChangedId: number | null = null;
 
     constructor() {
         this.machineDefinition = {
@@ -137,7 +138,7 @@ export class PlaybackState {
             },
         };
 
-        this.renderer.proxy.connectSignal(
+        this.isPlayingChangedId = this.renderer.proxy.connectSignal(
             'isPlayingChanged',
             (_proxy: Gio.DBusProxy, _sender: string, [isPlaying]: [boolean]) => {
                 if (isPlaying && this.getCurrentState() !== 'playing')
@@ -145,6 +146,13 @@ export class PlaybackState {
             }
         );
         this.reset();
+    }
+
+    destroy(): void {
+        if (this.isPlayingChangedId !== null) {
+            this.renderer.proxy.disconnectSignal(this.isPlayingChangedId);
+            this.isPlayingChangedId = null;
+        }
     }
 
     getCurrentState(): StateName {

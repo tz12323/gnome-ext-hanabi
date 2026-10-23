@@ -77,6 +77,8 @@ const AutoPauseModule = GObject.registerClass(
     class AutoPauseModule extends GObject.Object {
         protected settings: Gio.Settings;
         protected logger: Logger;
+        // Settings signal handlers created by the module, disconnected in disable().
+        protected settingsChangedIds: number[] = [];
 
         constructor(settings: Gio.Settings, moduleName?: string) {
             super();
@@ -84,6 +86,12 @@ const AutoPauseModule = GObject.registerClass(
             this.logger = moduleName
                 ? new Logger(`autoPause::${moduleName}`)
                 : logger;
+        }
+
+        protected connectSetting(key: string, callback: () => void): void {
+            this.settingsChangedIds.push(
+                this.settings.connect(`changed::${key}`, callback)
+            );
         }
 
         enable(): void { }
@@ -96,7 +104,11 @@ const AutoPauseModule = GObject.registerClass(
             return false;
         }
 
-        disable(): void { }
+        disable(): void {
+            for (const id of this.settingsChangedIds)
+                this.settings.disconnect(id);
+            this.settingsChangedIds = [];
+        }
     }
 );
 
@@ -143,14 +155,11 @@ const PauseOnMaximizeOrFullscreenModule = GObject.registerClass(
                     'pause-on-maximize-or-fullscreen'
                 ),
             };
-            this.settings.connect(
-                'changed::pause-on-maximize-or-fullscreen',
-                () => {
-                    this.conditions.pauseOnMaximizeOrFullscreen =
-                        this.settings.get_int('pause-on-maximize-or-fullscreen');
-                    this.update();
-                }
-            );
+            this.connectSetting('pause-on-maximize-or-fullscreen', () => {
+                this.conditions.pauseOnMaximizeOrFullscreen =
+                    this.settings.get_int('pause-on-maximize-or-fullscreen');
+                this.update();
+            });
 
             this.workspaceManager = null;
             this.activeWorkspace = null;
@@ -305,12 +314,15 @@ const PauseOnMaximizeOrFullscreenModule = GObject.registerClass(
         }
 
         override disable(): void {
-            this.workspaceManager?.disconnect(this.activeWorkspaceChangedId!);
+            if (this.workspaceManager && this.activeWorkspaceChangedId)
+                this.workspaceManager.disconnect(this.activeWorkspaceChangedId);
             this.windows.forEach(({metaWindow, signals}) =>
                 signals.forEach(signal => metaWindow.disconnect(signal))
             );
-            this.activeWorkspace?.disconnect(this.windowAddedId!);
-            this.activeWorkspace?.disconnect(this.windowRemovedId!);
+            if (this.activeWorkspace && this.windowAddedId)
+                this.activeWorkspace.disconnect(this.windowAddedId);
+            if (this.activeWorkspace && this.windowRemovedId)
+                this.activeWorkspace.disconnect(this.windowRemovedId);
 
             this.workspaceManager = null;
             this.activeWorkspace = null;
@@ -318,6 +330,8 @@ const PauseOnMaximizeOrFullscreenModule = GObject.registerClass(
             this.windows = [];
             this.windowAddedId = null;
             this.windowRemovedId = null;
+
+            super.disable();
         }
     }
 );
@@ -341,7 +355,7 @@ const PauseOnFocusModule = GObject.registerClass(
             this.conditions = {
                 pauseOnFocus: this.settings.get_boolean('pause-on-focus'),
             };
-            this.settings.connect('changed::pause-on-focus', () => {
+            this.connectSetting('pause-on-focus', () => {
                 this.conditions.pauseOnFocus = this.settings.get_boolean('pause-on-focus');
                 this.update();
             });
@@ -417,6 +431,8 @@ const PauseOnFocusModule = GObject.registerClass(
             this.display = null;
             this.focusWindowChangedId = null;
             this.appearsFocusedId = null;
+
+            super.disable();
         }
     }
 );
@@ -436,6 +452,7 @@ const PauseOnBatteryModule = GObject.registerClass(
         private states: { onBattery: boolean; lowBattery: boolean };
         private conditions: { pauseOnBattery: number; lowBatteryThreshold: number };
         private upower: UPowerWrapper;
+        private upowerPropertiesChangedId: number | null = null;
 
         constructor(settings: Gio.Settings) {
             super(settings, 'battery');
@@ -444,11 +461,11 @@ const PauseOnBatteryModule = GObject.registerClass(
                 pauseOnBattery: this.settings.get_int('pause-on-battery'),
                 lowBatteryThreshold: this.settings.get_int('low-battery-threshold'),
             };
-            this.settings.connect('changed::pause-on-battery', () => {
+            this.connectSetting('pause-on-battery', () => {
                 this.conditions.pauseOnBattery = this.settings.get_int('pause-on-battery');
                 this.update();
             });
-            this.settings.connect('changed::low-battery-threshold', () => {
+            this.connectSetting('low-battery-threshold', () => {
                 this.conditions.lowBatteryThreshold = this.settings.get_int('low-battery-threshold');
                 this.update();
             });
@@ -457,7 +474,7 @@ const PauseOnBatteryModule = GObject.registerClass(
         }
 
         override enable(): void {
-            this.upower.proxy.connect(
+            this.upowerPropertiesChangedId = this.upower.proxy.connect(
                 'g-properties-changed',
                 (_proxy: Gio.DBusProxy, properties: GLib.Variant) => {
                     const payload = properties.deep_unpack<Record<string, unknown>>();
@@ -502,7 +519,13 @@ const PauseOnBatteryModule = GObject.registerClass(
             return res;
         }
 
-        override disable(): void { }
+        override disable(): void {
+            if (this.upowerPropertiesChangedId !== null) {
+                this.upower.proxy.disconnect(this.upowerPropertiesChangedId);
+                this.upowerPropertiesChangedId = null;
+            }
+            super.disable();
+        }
     }
 );
 
@@ -522,6 +545,7 @@ const PauseOnMprisPlayingModule = GObject.registerClass(
         private conditions: { pauseOnMprisPlaying: boolean };
         private dbus: DBusWrapper;
         private mediaPlayers: Record<string, MediaPlayerEntry>;
+        private nameOwnerChangedId: number | null = null;
 
         constructor(settings: Gio.Settings) {
             super(settings, 'mpris');
@@ -529,7 +553,7 @@ const PauseOnMprisPlayingModule = GObject.registerClass(
             this.conditions = {
                 pauseOnMprisPlaying: this.settings.get_boolean('pause-on-mpris-playing'),
             };
-            this.settings.connect('changed::pause-on-mpris-playing', () => {
+            this.connectSetting('pause-on-mpris-playing', () => {
                 this.conditions.pauseOnMprisPlaying =
                     this.settings.get_boolean('pause-on-mpris-playing');
                 this.update();
@@ -555,7 +579,7 @@ const PauseOnMprisPlayingModule = GObject.registerClass(
             this.logger.debug(this.stringifyMediaPlayers());
 
 
-            this.dbus.proxy.connectSignal(
+            this.nameOwnerChangedId = this.dbus.proxy.connectSignal(
                 'NameOwnerChanged',
                 (
                     _proxy: Gio.DBusProxy,
@@ -577,9 +601,11 @@ const PauseOnMprisPlayingModule = GObject.registerClass(
                         this.mediaPlayers[mprisName] = {playbackStatus, mpris, mprisPropertiesChangedId};
                     } else if (newOwner === '') {
                         this.logger.debug('Media Player destroyed:', mprisName);
-                        const {mpris, mprisPropertiesChangedId} = this.mediaPlayers[mprisName];
-                        mpris.proxy.disconnect(mprisPropertiesChangedId);
-                        delete this.mediaPlayers[mprisName];
+                        const entry = this.mediaPlayers[mprisName];
+                        if (entry) {
+                            entry.mpris.proxy.disconnect(entry.mprisPropertiesChangedId);
+                            delete this.mediaPlayers[mprisName];
+                        }
                     }
                     this.logger.debug(this.stringifyMediaPlayers());
                     this.update();
@@ -637,10 +663,16 @@ const PauseOnMprisPlayingModule = GObject.registerClass(
         }
 
         override disable(): void {
+            if (this.nameOwnerChangedId !== null) {
+                this.dbus.proxy.disconnectSignal(this.nameOwnerChangedId);
+                this.nameOwnerChangedId = null;
+            }
             Object.values(this.mediaPlayers).forEach(({mpris, mprisPropertiesChangedId}) =>
                 mpris.proxy.disconnect(mprisPropertiesChangedId)
             );
             this.mediaPlayers = {};
+
+            super.disable();
         }
     }
 );

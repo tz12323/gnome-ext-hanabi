@@ -39,6 +39,17 @@ const RENDERER_POLL_INTERVAL_MS = 1000;
 // the full wallpaper pipeline at video frame rate.
 const SAMPLE_REFRESH_INTERVAL_MS = 100;
 
+// A Blur My Shell static-blur sampling container we mirror the live frame into.
+interface SampleTarget {
+    clone: Clutter.Clone | null;
+    destroyId: number;
+    // Re-raises our clone when BMS adds a replacement Meta.BackgroundActor.
+    childAddedId: number;
+    // Coalesces deferred re-raise requests (0 = none pending).
+    raiseSourceId: number;
+    refreshId: number;
+}
+
 export const LiveWallpaper = GObject.registerClass(
     class LiveWallpaper extends St.Widget {
         // Background actor we sit on, and values derived from it.
@@ -63,15 +74,7 @@ export const LiveWallpaper = GObject.registerClass(
         private sourceDestroyId: number | null = null;
         // Containers created by Blur My Shell for static panel/dock blur. They need
         // a live clone so their samples use the video instead of the static wallpaper.
-        private sampleTargets = new Map<
-            Clutter.Actor,
-            {
-                clone: Clutter.Clone | null;
-                destroyId: number;
-                refreshId: number;
-                isDock: boolean;
-            }
-        >();
+        private sampleTargets = new Map<Clutter.Actor, SampleTarget>();
 
         // Rendering effect and monitor geometry, set up in the constructor.
         private roundedCornersEffect!: RoundedCornersEffect;
@@ -86,7 +89,13 @@ export const LiveWallpaper = GObject.registerClass(
             getWindowActors: () => Meta.WindowActor[]
         ) {
             super({
+                // Fill the background actor's allocation. The overview shrinks the
+                // workspace to a small preview in the app-grid state; without FILL the
+                // clone keeps its monitor-sized allocation and is painted as a small
+                // cropped rectangle in the top-left corner.
                 layout_manager: new Clutter.BinLayout(),
+                x_align: Clutter.ActorAlign.FILL,
+                y_align: Clutter.ActorAlign.FILL,
                 width: backgroundActor.width,
                 height: backgroundActor.height,
                 x_expand: true,
@@ -139,7 +148,7 @@ export const LiveWallpaper = GObject.registerClass(
 
             this.settingsChangedIds.push(
                 this.settings.connect('changed::border-stroke', () => {
-                    this.setBorderStroke(this.settings.get_int('border-stroke'));
+                    this.setBorderStroke(this.settings.get_int('border-stroke') * this.monitorScale);
                     this.backgroundActor?.queue_redraw();
                 })
             );
@@ -154,12 +163,21 @@ export const LiveWallpaper = GObject.registerClass(
             this.setRoundedClipBounds(0, 0, this.monitorWidth, this.monitorHeight);
 
             this.connect('notify::allocation', () => {
-                if (!this.wallpaper)
+                if (this.isDisposed)
                     return;
                 try {
+                    if (this.width <= 0 || this.height <= 0)
+                        return;
+                    // The overview can allocate the workspace background at a
+                    // fraction of the monitor size (the small workspace preview in
+                    // the app grid). Keep the shader's pixel step and bounds in
+                    // sync with the current allocation instead of the monitor size.
+                    this.setPixelStep(this.width, this.height);
                     this.applyBounds();
-                    const stroke = this.settings.get_int('border-stroke');
-                    this.roundedCornersEffect.setBorderStroke(stroke * this.monitorScale);
+                    this.roundedCornersEffect.setBorderStroke(
+                        this.settings.get_int('border-stroke') * this.monitorScale
+                    );
+                    this.backgroundActor?.queue_redraw();
                 } catch (e) {
                     logError(e as object, 'LiveWallpaper notify::allocation');
                 }
@@ -174,6 +192,8 @@ export const LiveWallpaper = GObject.registerClass(
         }
 
         private applyBounds(): void {
+            if (this.isDisposed)
+                return;
             const workArea = Main.layoutManager.getWorkAreaForMonitor(this.monitorIndex);
             const monitor = Main.layoutManager.monitors[this.monitorIndex];
             const panelOffset = (workArea.y - monitor.y) / monitor.height * this.backgroundActor.height;
@@ -230,53 +250,95 @@ export const LiveWallpaper = GObject.registerClass(
             if (this.isDisposed || this.sampleTargets.has(container))
                 return;
 
-            const destroyId = container.connect('destroy', () => {
-                const target = this.sampleTargets.get(container);
-                if (target?.refreshId) {
-                    GLib.source_remove(target.refreshId);
-                    target.refreshId = 0;
-                }
-                this.sampleTargets.delete(container);
-            });
-            const target: {
-                clone: Clutter.Clone | null;
-                destroyId: number;
-                refreshId: number;
-                isDock: boolean;
-            } = {
+            const target: SampleTarget = {
                 clone: null,
-                destroyId,
+                destroyId: 0,
+                childAddedId: 0,
+                raiseSourceId: 0,
                 refreshId: 0,
-                isDock: container.get_name()?.includes('dash') ?? false,
             };
-            this.sampleTargets.set(container, target);
-            if (target.isDock) {
-                // Blur My Shell caches static blur input and only refreshes it when
-                // the container is damaged. A video surface does not damage its parent,
-                // so the dock would otherwise keep the first frame indefinitely.
-                target.refreshId = GLib.timeout_add(
-                    GLib.PRIORITY_DEFAULT,
-                    SAMPLE_REFRESH_INTERVAL_MS,
-                    () => {
-                        const clone = target.clone;
-                        if (!clone) {
-                            target.refreshId = 0;
-                            return GLib.SOURCE_REMOVE;
-                        }
 
-                        // queue_redraw marks the BMS effect input dirty; the effect's
-                        // own queue_repaint only schedules its output.
-                        clone.queue_redraw();
-                        container.queue_redraw();
-                        container.get_effects().forEach(effect => effect.queue_repaint());
-                        // Dash to Dock can stay mapped to the old damage region.
-                        // Force the full sample allocation dirty as well.
-                        clone.queue_redraw_with_clip(null);
+            target.destroyId = container.connect('destroy', () => {
+                // The container is being disposed; don't disconnect this handler.
+                target.destroyId = 0;
+                this.destroySampleTarget(container, target);
+            });
+
+            // Blur My Shell replaces its Meta.BackgroundActor after a background
+            // change (and adds it above our clone), which would hide the live frame
+            // behind the static wallpaper again. Re-raise our clone whenever the
+            // sampling container gains a child.
+            target.childAddedId = container.connect('child-added', () => {
+                this.queueSampleTargetRaise(container, target);
+            });
+
+            this.sampleTargets.set(container, target);
+            this.ensureSampleRefresh(container, target);
+            this.syncSampleTargets();
+        }
+
+        private ensureSampleRefresh(container: Clutter.Actor, target: SampleTarget): void {
+            if (target.refreshId || this.isDisposed)
+                return;
+
+            // Blur My Shell's static blur keeps its last sampled texture and only
+            // refreshes when its input is damaged. A video surface does not damage
+            // its parent, so keep the sample input dirty. This is needed for the
+            // panel too, not only the dock: both can use BMS static blur.
+            target.refreshId = GLib.timeout_add(
+                GLib.PRIORITY_DEFAULT,
+                SAMPLE_REFRESH_INTERVAL_MS,
+                () => {
+                    if (this.isDisposed)
+                        return GLib.SOURCE_REMOVE;
+
+                    const clone = target.clone;
+                    if (!clone) {
+                        // Keep polling: the renderer window may not have appeared
+                        // yet, and the clone is created after it does.
                         return GLib.SOURCE_CONTINUE;
                     }
-                );
+
+                    this.raiseSampleClone(container, target);
+                    this.queueSampleTargetDamage(container, clone);
+                    return GLib.SOURCE_CONTINUE;
+                }
+            );
+        }
+
+        private queueSampleTargetRaise(container: Clutter.Actor, target: SampleTarget): void {
+            if (target.raiseSourceId || this.isDisposed)
+                return;
+
+            target.raiseSourceId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                target.raiseSourceId = 0;
+                this.raiseSampleClone(container, target);
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+
+        private raiseSampleClone(container: Clutter.Actor, target: SampleTarget): void {
+            const clone = target.clone;
+            if (!clone || this.isDisposed)
+                return;
+            if (clone.get_parent() === container && container.get_last_child() !== clone)
+                container.set_child_above_sibling(clone, null);
+        }
+
+        private queueSampleTargetDamage(container: Clutter.Actor, clone: Clutter.Clone): void {
+            clone.queue_redraw();
+            // Dash to Dock can stay mapped to the old damage region. Force the
+            // full sample allocation dirty as well.
+            clone.queue_redraw_with_clip(null);
+
+            // The BMS blur effect lives on an ancestor of the sampling container,
+            // not on the container itself; walk up and invalidate it.
+            let actor: Clutter.Actor | null = container;
+            for (let i = 0; actor && i < 4; i++) {
+                actor.queue_redraw();
+                actor.get_effects().forEach(effect => effect.queue_repaint());
+                actor = actor.get_parent();
             }
-            this.syncSampleTargets();
         }
 
         private syncSampleTargets(): void {
@@ -287,8 +349,13 @@ export const LiveWallpaper = GObject.registerClass(
                 if (target.clone)
                     continue;
 
+                // Clone the renderer actor directly instead of the main clone:
+                // the main clone is resized to the workspace allocation (which is
+                // small in the app-grid state), while the blur sample must always
+                // stay at full monitor resolution.
+                const source = this.wallpaper.source ?? this.wallpaper;
                 const clone = new Clutter.Clone({
-                    source: this.wallpaper,
+                    source,
                     width: this.monitorWidth,
                     height: this.monitorHeight,
                 });
@@ -297,29 +364,54 @@ export const LiveWallpaper = GObject.registerClass(
                 // frame above it so the sample is not a composite of both images.
                 container.set_child_above_sibling(clone, null);
                 target.clone = clone;
+                this.ensureSampleRefresh(container, target);
             }
         }
 
         private clearSampleClones(): void {
             for (const target of this.sampleTargets.values()) {
-                if (target.refreshId) {
-                    GLib.source_remove(target.refreshId);
-                    target.refreshId = 0;
-                }
                 target.clone?.destroy();
                 target.clone = null;
             }
         }
 
-        private destroySampleTargets(): void {
-            for (const [container, target] of this.sampleTargets) {
-                if (target.refreshId) {
-                    GLib.source_remove(target.refreshId);
-                    target.refreshId = 0;
-                }
-                container.disconnect(target.destroyId);
-                target.clone?.destroy();
+        // Detach the live frame from a BMS sampling container (used when another
+        // LiveWallpaper becomes the preferred sample source for this monitor).
+        removeSampleTarget(container: Clutter.Actor): void {
+            const target = this.sampleTargets.get(container);
+            if (target)
+                this.destroySampleTarget(container, target);
+        }
+
+        private destroySampleTarget(container: Clutter.Actor, target: SampleTarget): void {
+            if (target.refreshId) {
+                GLib.source_remove(target.refreshId);
+                target.refreshId = 0;
             }
+            if (target.raiseSourceId) {
+                GLib.source_remove(target.raiseSourceId);
+                target.raiseSourceId = 0;
+            }
+
+            try {
+                if (target.childAddedId)
+                    container.disconnect(target.childAddedId);
+                if (target.destroyId)
+                    container.disconnect(target.destroyId);
+            } catch {
+                // The container may already be partly disposed.
+            }
+            target.childAddedId = 0;
+            target.destroyId = 0;
+
+            target.clone?.destroy();
+            target.clone = null;
+            this.sampleTargets.delete(container);
+        }
+
+        private destroySampleTargets(): void {
+            for (const [container, target] of [...this.sampleTargets])
+                this.destroySampleTarget(container, target);
             this.sampleTargets.clear();
         }
 
@@ -338,6 +430,14 @@ export const LiveWallpaper = GObject.registerClass(
                     this.wallpaper = new Clutter.Clone({
                         source: renderer,
                         pivot_point: new Graphene.Point({x: 0.5, y: 0.5}),
+                        // Scale the clone to the LiveWallpaper allocation instead of
+                        // keeping it at the renderer's monitor size. The overview
+                        // allocates the workspace background at a fraction of the
+                        // monitor size in the app-grid state.
+                        x_expand: true,
+                        y_expand: true,
+                        x_align: Clutter.ActorAlign.FILL,
+                        y_align: Clutter.ActorAlign.FILL,
                     });
                     this.wallpaper.connect('destroy', () => {
                         this.wallpaper = null;
