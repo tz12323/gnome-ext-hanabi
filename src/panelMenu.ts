@@ -171,12 +171,6 @@ export class HanabiPanelMenu {
         }
 
         videoPaths = videoPaths.sort();
-        enumerator.close(null);
-
-        // Nothing to switch to (empty directory or no video files).
-        if (videoPaths.length === 0)
-            return;
-
         const currentVideoPath = this.settings.get_string('video-path');
         const currentIndex = videoPaths.findIndex(p => p === currentVideoPath);
         const nextIndex = currentIndex !== -1

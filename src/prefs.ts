@@ -26,21 +26,12 @@ import {
 
 interface PrefsWindow extends Adw.PreferencesWindow {
     settings: Gio.Settings;
-    // Settings handlers that must be disconnected when the window closes.
-    settingsSignalIds: number[];
 }
 
 export default class HanabiExtensionPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window: Adw.PreferencesWindow): Promise<void> {
         const win = window as PrefsWindow;
         win.settings = this.getSettings();
-        win.settingsSignalIds = [];
-        window.connect('close-request', () => {
-            for (const id of win.settingsSignalIds)
-                win.settings.disconnect(id);
-            win.settingsSignalIds = [];
-            return false;
-        });
 
         const page = new Adw.PreferencesPage();
 
@@ -154,7 +145,7 @@ function prefsRowInt(
     });
 
     adjustment.connect('value-changed', () => {
-        settings.set_int(key, Math.round(adjustment.value));
+        settings.set_int(key, adjustment.value);
     });
 
     const spin = new Gtk.SpinButton({
@@ -184,14 +175,6 @@ function prefsRowVideoPath(window: PrefsWindow, prefsGroup: Adw.PreferencesGroup
 
     row.activatable_widget = button;
     row.add_suffix(button);
-
-    // Keep the subtitle in sync when the path is changed elsewhere (panel menu,
-    // automatic wallpaper changer, or a script).
-    const videoPathChangedId = settings.connect(`changed::${key}`, () => {
-        const currentPath = settings.get_string(key);
-        row.subtitle = currentPath !== '' ? currentPath : _('None');
-    });
-    window.settingsSignalIds.push(videoPathChangedId);
 
     row.connect('activated', () => {
         const fileFilter = new Gtk.FileFilter();
@@ -233,12 +216,6 @@ function prefsRowDirectoryPath(window: PrefsWindow, prefsGroup: Adw.PreferencesG
 
     row.activatable_widget = button;
     row.add_suffix(button);
-
-    const directoryPathChangedId = settings.connect(`changed::${key}`, () => {
-        const currentPath = settings.get_string(key);
-        row.subtitle = currentPath !== '' ? currentPath : _('None');
-    });
-    window.settingsSignalIds.push(directoryPathChangedId);
 
     row.connect('activated', () => {
         const dialog = new Gtk.FileDialog({title: _('Select Directory'), modal: true});
@@ -398,7 +375,7 @@ function prefsRowBoundsInset(window: PrefsWindow, prefsGroup: Adw.PreferencesGro
             page_increment: 10,
             value: settings.get_int(key),
         });
-        adjustment.connect('value-changed', () => settings.set_int(key, Math.round(adjustment.value)));
+        adjustment.connect('value-changed', () => settings.set_int(key, adjustment.value));
         child.add_suffix(new Gtk.SpinButton({adjustment, valign: Gtk.Align.CENTER}));
         expander.add_row(child);
     }

@@ -6,8 +6,6 @@
 
 # GNOME Shell Extension - Hanabi
 
-**English** | [简体中文](README_CN.md)
-
 If you like my project, please consider buying me a coffee!! (⁎˃ ꇴ ˂⁎)ｯ
 
 [![Github-sponsors](https://img.shields.io/badge/sponsor-30363D?style=for-the-badge&logo=GitHub-Sponsors&logoColor=#EA4AAA)](https://github.com/sponsors/jeffshee)
@@ -69,9 +67,8 @@ Please click on the image to view _(redirect to YouTube)_
     ```
 
     **Build dependencies**
-    - `main` branch: `meson`, `ninja`, `node`, and `npm`
-    - `javascript` branch: `meson` and `ninja`
-    - `glib-compile-schemas` is needed at install time (usually provided by `libglib2.0-bin`)
+    - `main` branch: `meson`, `node`, and `npm`
+    - `javascript` branch: `meson`
 
 3. Restart GNOME Shell
 
@@ -82,9 +79,6 @@ Please click on the image to view _(redirect to YouTube)_
 ### Distro-specific Guides
 
 See the [distro-specific guides](docs/distro/) for installation instructions.
-
-> These guides were written for the `javascript` branch. When building the `main`
-> branch (GNOME 50–51), also install `ninja`, `node`, and `npm`.
 
 ### Troubleshooting
 

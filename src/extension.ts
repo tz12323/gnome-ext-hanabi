@@ -53,9 +53,6 @@ export default class HanabiExtension extends Extension {
     // Renderer subprocess and its relaunch timeout.
     private currentProcess: WaylandSubprocess | null = null;
     private launchRendererTimeoutId = 0;
-    // Timeout used for the startup delay before innerEnable(); tracked so a
-    // disable() during startup does not enable the extension afterwards.
-    private startupTimeoutId = 0;
     private reloadTime = RENDERER_RELOAD_DELAY_MS;
     private rendererSuspended = false;
 
@@ -101,11 +98,10 @@ export default class HanabiExtension extends Extension {
                 () => {
                     // Issue #65: don't open the overview at login.
                     Main.overview.hide();
-                    this.startupTimeoutId = GLib.timeout_add(
+                    GLib.timeout_add(
                         GLib.PRIORITY_DEFAULT,
                         this.settings!.get_int('startup-delay'),
                         () => {
-                            this.startupTimeoutId = 0;
                             this.innerEnable();
                             return false;
                         }
@@ -114,11 +110,10 @@ export default class HanabiExtension extends Extension {
             );
             this.signalConnections.push([Main.layoutManager, startupCompleteId]);
         } else {
-            this.startupTimeoutId = GLib.timeout_add(
+            GLib.timeout_add(
                 GLib.PRIORITY_DEFAULT,
                 this.settings.get_int('startup-delay'),
                 () => {
-                    this.startupTimeoutId = 0;
                     this.innerEnable();
                     return false;
                 }
@@ -162,10 +157,8 @@ export default class HanabiExtension extends Extension {
         this.signalConnections.push([this.settings!, showOnLockScreenChangedId]);
 
         this.isEnabled = true;
-        if (this.launchRendererTimeoutId) {
+        if (this.launchRendererTimeoutId)
             GLib.source_remove(this.launchRendererTimeoutId);
-            this.launchRendererTimeoutId = 0;
-        }
 
         this.launchRenderer();
     }
@@ -260,16 +253,6 @@ export default class HanabiExtension extends Extension {
     disable(): void {
         logger.debug('Disabling');
 
-        // Mark disabled first: killCurrentProcess() only reschedules a relaunch
-        // while isEnabled is true, so ordering this after the kill would start a
-        // new renderer as the extension is being torn down.
-        this.isEnabled = false;
-
-        if (this.startupTimeoutId) {
-            GLib.source_remove(this.startupTimeoutId);
-            this.startupTimeoutId = 0;
-        }
-
         this.killCurrentProcess();
         this.rendererSuspended = false;
 
@@ -281,20 +264,13 @@ export default class HanabiExtension extends Extension {
         this.shellOverride?.disable();
         this.windowManager?.disable();
         this.autoPause?.disable();
-        this.playbackState?.destroy();
-
-        // Drop references so a disabled extension does not keep the shell
-        // objects alive until it is enabled again.
-        this.panelMenu = null;
-        this.shellOverride = null;
-        this.windowManager = null;
-        this.autoPause = null;
-        this.playbackState = null;
 
         if (this.monitorsChangedTimeoutId) {
             GLib.source_remove(this.monitorsChangedTimeoutId);
             this.monitorsChangedTimeoutId = 0;
         }
+
+        this.isEnabled = false;
     }
 
     private killCurrentProcess(): void {
@@ -342,21 +318,16 @@ export default class HanabiExtension extends Extension {
             if (!processUser.query_exists(null))
                 continue;
 
+            const [binaryData] = processUser.load_bytes(null);
             let contents = '';
-            try {
-                const [binaryData] = processUser.load_bytes(null);
-                const readData = binaryData.get_data();
-                if (readData) {
-                    for (let i = 0; i < readData.length; i++) {
-                        if (readData[i] < 32)
-                            contents += ' ';
-                        else
-                            contents += String.fromCharCode(readData[i]);
-                    }
+            const readData = binaryData.get_data();
+            if (readData) {
+                for (let i = 0; i < readData.length; i++) {
+                    if (readData[i] < 32)
+                        contents += ' ';
+                    else
+                        contents += String.fromCharCode(readData[i]);
                 }
-            } catch {
-                // The process may have exited between the exists check and the read.
-                continue;
             }
             const path = `gjs ${GLib.build_filenamev([this.path, 'renderer', 'renderer.js'])}`;
             if (contents.startsWith(path)) {
@@ -366,6 +337,5 @@ export default class HanabiExtension extends Extension {
                 proc.wait(null);
             }
         }
-        fileEnum.close(null);
     }
 }
