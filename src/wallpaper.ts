@@ -247,7 +247,7 @@ export const LiveWallpaper = GObject.registerClass(
                 clone: null,
                 destroyId,
                 refreshId: 0,
-                isDock: container.get_name()?.includes('dash') ?? false,
+                isDock: /dash|dock/.test(container.get_name() ?? ''),
             };
             this.sampleTargets.set(container, target);
             if (target.isDock) {

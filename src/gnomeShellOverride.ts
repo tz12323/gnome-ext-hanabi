@@ -37,6 +37,10 @@ const logger = new Logger('override');
 // Delay before forcing a workarea/monitor refresh after reloading backgrounds (ms).
 const BACKGROUND_RELOAD_REFRESH_DELAY_MS = 500;
 
+// Only the panel and dock samples should receive the live wallpaper. Other
+// Blur My Shell samples (overview, workspace animation, application blur,
+// popups, screenshots) have their own animated/clipped actor trees and would
+// show a duplicate wallpaper layer when given a live clone.
 function isRendererWindow(window: Meta.Window | null | undefined): boolean {
     return window?.title?.includes(APPLICATION_ID) === true;
 }
@@ -44,6 +48,20 @@ function isRendererWindow(window: Meta.Window | null | undefined): boolean {
 function isRendererActor(actor: Meta.WindowActor | null | undefined): boolean {
     const window = actor?.meta_window;
     return isRendererWindow(window);
+}
+
+function isLiveWallpaperSample(container: Clutter.Actor | null): boolean {
+    const name = container?.get_name();
+    if (!name?.endsWith('-source'))
+        return false;
+
+    // BMS versions and dock implementations use slightly different widget
+    // names (dash-to-dock, dash-to-panel, native dash, ...). Match the role
+    // rather than one exact string, while still excluding overview/animation
+    // and application blur samples.
+    return name === 'bms-panel-blurred-widget-source'
+        || name.includes('dash')
+        || name.includes('dock');
 }
 
 export class GnomeShellOverride {
@@ -122,6 +140,19 @@ export class GnomeShellOverride {
         this.blurSamples.clear();
     }
 
+    private scanBlurSamples(actor: Clutter.Actor = Main.uiGroup): void {
+        if (isLiveWallpaperSample(actor)) {
+            const backgroundActor = actor.get_children().find(
+                child => child instanceof Meta.BackgroundActor
+            ) as Meta.BackgroundActor | undefined;
+            if (backgroundActor)
+                this.registerBlurSample(actor, backgroundActor.monitor);
+        }
+
+        for (const child of actor.get_children())
+            this.scanBlurSamples(child);
+    }
+
     private markRendererWindows(): void {
         for (const actor of this.getAllWindowActors()) {
             const window = actor.meta_window;
@@ -191,11 +222,13 @@ export class GnomeShellOverride {
 
                     const container = this._container as Clutter.Actor | null;
                     // Blur My Shell creates short-lived BackgroundManagers for
-                    // static panel/dock blur. Give their sampling container a
-                    // lightweight clone of the primary live actor instead of a
+                    // static panel/dock blur. Give only those sampling containers
+                    // a lightweight clone of the primary live actor instead of a
                     // second LiveWallpaper (which owns lifecycle/effects state).
-                    if (container?.get_name()?.endsWith('-source')) {
-                        logger.debug(`Attaching blur sample (monitor ${backgroundActor.monitor})`);
+                    if (container && isLiveWallpaperSample(container)) {
+                        logger.debug(
+                            `Attaching blur sample ${container.get_name()} (monitor ${backgroundActor.monitor})`
+                        );
                         thisRef.registerBlurSample(container, backgroundActor.monitor);
                         return backgroundActor;
                     }
@@ -367,12 +400,23 @@ export class GnomeShellOverride {
         );
 
         this.settingsChangedIds.push(
+            Main.uiGroup.connect('child-added', (_group, child: Clutter.Actor) => {
+                if (child.get_name()?.endsWith('-source'))
+                    thisRef.scanBlurSamples();
+            })
+        );
+
+        this.settingsChangedIds.push(
             this.settings.connect('changed::show-on-lock-screen', () => {
                 this.reloadLockScreenBackgrounds();
             })
         );
 
         this.reloadBackgrounds();
+        // Blur My Shell is usually enabled before Hanabi, so its static panel
+        // and dock sampling containers already exist and never pass through the
+        // BackgroundManager override above. Pick those existing containers up.
+        this.scanBlurSamples();
         // Renderers can already exist when the extension is re-enabled.
         this.markRendererWindows();
         this.hideRendererWindows();
